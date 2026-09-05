@@ -155,11 +155,12 @@ func TestWebServerServesAnAuthenticatedUIAndTokenisedSnapshots(t *testing.T) {
 	healthState := health.NewState(time.Now())
 	healthState.SetLive(true)
 	runtime := app.New(app.RuntimeConfig{Registry: registry, Health: healthState})
-	snapshots, err := startWebServer(ctx, cfg, registry, runtime, newTemperatureStore(), healthState,
+	web, err := startWebServer(ctx, cfg, registry, runtime, newTemperatureStore(), healthState,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("startWebServer: %v", err)
 	}
+	snapshots := web.cache()
 	defer snapshots.Close()
 	if snapshots.Token() == "" {
 		t.Fatal("a published snapshot URL needs a token")
@@ -216,4 +217,134 @@ func waitForServer(t *testing.T, base string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("the web server never started listening")
+}
+
+// A credential refresh that added a camera reaches the Ingress listener too.
+// The stills, the media proxy's stream allowlist and the page's own camera list
+// were each fixed at startup, so the new camera used to answer 404 for its
+// thumbnail and "unknown stream" for its video until the add-on was restarted.
+func TestReloadTeachesTheWebStackANewCamera(t *testing.T) {
+	go2rtc := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/frame.jpeg" {
+			writer.Header().Set("Content-Type", "image/jpeg")
+			_, _ = writer.Write([]byte{0xFF, 0xD8, 0x00})
+			return
+		}
+		_, _ = writer.Write([]byte("go2rtc web ui"))
+	}))
+	defer go2rtc.Close()
+
+	first := bridge.Credentials{DeviceUDID: "a", DeviceName: "Room A", SID: "s", DeviceToken: "t", ControlHost: "relay"}
+	second := bridge.Credentials{DeviceUDID: "b", DeviceName: "Room B", SID: "s", DeviceToken: "t", ControlHost: "relay"}
+	registry, err := app.BuildRegistry("127.0.0.1:8554", []bridge.Credentials{first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := appconfig.Config{
+		IngressAddr:       "127.0.0.1:0",
+		SnapshotTokenFile: filepath.Join(t.TempDir(), "snapshot-token"),
+		Go2RTCURL:         go2rtc.URL,
+		StreamURL:         "rtsp://stream.example:8555/vm65",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.IngressAddr = listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	healthState := health.NewState(time.Now())
+	healthState.SetLive(true)
+	runtime := app.New(app.RuntimeConfig{Registry: registry, Health: healthState})
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	web, err := startWebServer(ctx, cfg, registry, runtime, newTemperatureStore(), healthState, logger)
+	if err != nil {
+		t.Fatalf("startWebServer: %v", err)
+	}
+	defer web.cache().Close()
+
+	base := "http://" + cfg.IngressAddr
+	waitForServer(t, base)
+	token := web.cache().Token()
+
+	if status := getStatus(t, base+"/snapshot?src=room-b&token="+token, nil); status != http.StatusNotFound {
+		t.Fatalf("a camera that is not in the registry answered %d, want %d", status, http.StatusNotFound)
+	}
+
+	grown, err := app.BuildRegistry("127.0.0.1:8554", []bridge.Credentials{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	web.reload(cfg, grown, logger)
+
+	if status := getStatus(t, base+"/snapshot?src=room-b&token="+token, nil); status != http.StatusOK {
+		t.Fatalf("the added camera's snapshot answered %d, want %d", status, http.StatusOK)
+	}
+	ingressHeaders := map[string]string{"X-Remote-User-Id": "01HQ"}
+	if status := getStatus(t, base+"/api/frame.jpeg?src=room-b", ingressHeaders); status != http.StatusOK {
+		t.Fatalf("the media proxy answered %d for the added camera, want %d", status, http.StatusOK)
+	}
+	// A stream nobody configured still has to be refused after a reload.
+	if status := getStatus(t, base+"/api/frame.jpeg?src=exec:id", ingressHeaders); status != http.StatusForbidden {
+		t.Fatalf("an unknown stream answered %d, want %d", status, http.StatusForbidden)
+	}
+	// And a camera that left the registry stops being served.
+	web.reload(cfg, registry, logger)
+	if status := getStatus(t, base+"/snapshot?src=room-b&token="+token, nil); status != http.StatusNotFound {
+		t.Fatalf("a removed camera answered %d, want %d", status, http.StatusNotFound)
+	}
+}
+
+func getStatus(t *testing.T, target string, headers map[string]string) int {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	return response.StatusCode
+}
+
+// A port that is already taken is a configuration error. Reporting it as a log
+// line while the process carried on left the Web UI and the snapshot endpoint
+// unreachable behind a line that claimed they were listening.
+func TestStartHTTPServerReportsAPortItCannotBind(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := http.NewServeMux()
+
+	if err := startHTTPServer(ctx, "web UI", occupied.Addr().String(), handler, logger); err == nil {
+		t.Fatal("binding a port that is in use reported no error")
+	}
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := free.Addr().String()
+	if err := free.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := startHTTPServer(ctx, "web UI", address, handler, logger); err != nil {
+		t.Fatalf("binding a free port failed: %v", err)
+	}
+	waitForServer(t, "http://"+address)
 }

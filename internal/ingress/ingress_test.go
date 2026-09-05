@@ -70,13 +70,13 @@ func TestAuthenticatedRequestReachesUpstream(t *testing.T) {
 
 	handler := newTestHandler(t, upstream.URL, "vm65")
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, authenticated(http.MethodGet, "/api/streams"))
+	handler.ServeHTTP(recorder, authenticated(http.MethodGet, "/api/frame.jpeg?src=vm65"))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
 	}
-	if seen == nil || seen.URL.Path != "/api/streams" {
-		t.Fatalf("upstream path = %v, want /api/streams", seen)
+	if seen == nil || seen.URL.Path != "/api/frame.jpeg" {
+		t.Fatalf("upstream path = %v, want /api/frame.jpeg", seen)
 	}
 	if got := seen.Header.Get(UserIDHeader); got != "01HQ" {
 		t.Fatalf("forwarded user id = %q, want 01HQ", got)
@@ -116,7 +116,16 @@ func TestConfigurationEndpointIsBlocked(t *testing.T) {
 	defer upstream.Close()
 
 	handler := newTestHandler(t, upstream.URL, "vm65")
-	for _, path := range []string{"/api/config", "/api/config/", "/api/restart", "/api/exit", "/api/streams.dot"} {
+	blocked := []string{
+		"/api/config", "/api/config/", "/api/restart", "/api/exit",
+		// The stream list carries the source URL of every active stream, and
+		// that URL is the RTSP password and the camera access token.
+		"/api/streams", "/api/streams.dot",
+		// A path go2rtc resolves to a blocked endpoint has to be refused in
+		// the shape it arrives in, not only in its cleaned form.
+		"//api/config", "/api/./config", "/api/../api/config", "/api/config/.",
+	}
+	for _, path := range blocked {
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, authenticated(http.MethodGet, path))
 		if recorder.Code != http.StatusForbidden {

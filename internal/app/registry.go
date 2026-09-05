@@ -41,7 +41,11 @@ func BuildRegistry(baseAddress string, credentials []bridge.Credentials) (Regist
 	}
 
 	registry := Registry{LegacyAlias: "vm65"}
-	usedNames := make(map[string]int)
+	// Every name that has been handed out, not a count per base name: counting
+	// alone hands "Nursery", "Nursery" and "Nursery 2" the names "nursery",
+	// "nursery-2" and "nursery-2" — two cameras sharing one go2rtc stream, one
+	// snapshot URL and one card on the page.
+	usedNames := make(map[string]bool, len(ordered))
 	for index, credential := range ordered {
 		listenPort := basePort
 		if index > 0 {
@@ -52,11 +56,11 @@ func BuildRegistry(baseAddress string, credentials []bridge.Credentials) (Regist
 			nameSource = "camera-" + credential.DeviceUDID
 		}
 		baseName := streamName(nameSource)
-		usedNames[baseName]++
 		name := baseName
-		if usedNames[baseName] > 1 {
-			name += "-" + strconv.Itoa(usedNames[baseName])
+		for suffix := 2; usedNames[name]; suffix++ {
+			name = baseName + "-" + strconv.Itoa(suffix)
 		}
+		usedNames[name] = true
 		registry.Cameras = append(registry.Cameras, Camera{
 			Credentials: credential,
 			StreamName:  name,

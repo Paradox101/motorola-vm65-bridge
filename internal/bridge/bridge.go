@@ -264,6 +264,12 @@ func (b *Bridge) Serve(ctx context.Context) error {
 	if err := b.Listen(); err != nil {
 		return err
 	}
+	// Read the listener once, under the lock that Listen and Close use. Accept
+	// then runs against a local copy instead of a field another goroutine may
+	// be writing.
+	b.mu.Lock()
+	listener := b.listener
+	b.mu.Unlock()
 	b.log.Info("bridge listening",
 		"addr", b.Addr().String(),
 		"control_host", b.cfg.Credentials.ControlHost,
@@ -284,7 +290,7 @@ func (b *Bridge) Serve(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 	for {
-		conn, err := b.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			closeStop()
 			wg.Wait()
@@ -430,9 +436,16 @@ func (b *Bridge) handle(ctx context.Context, client net.Conn) {
 // there to receive the result. Either one ending the dial frees this session's
 // slot instead of letting it run out the full retry sequence.
 func (b *Bridge) dial(ctx context.Context, log *slog.Logger, gone <-chan struct{}) (*magic.Tunnel, error) {
-	dialCtx, cancel := context.WithCancel(ctx)
+	// Both branches produce a cancellable context, and only one of them is
+	// created: overwriting a context.WithCancel result would drop its cancel
+	// func on the floor, and every such context stays attached to the
+	// long-lived per-camera context until the process ends.
+	var dialCtx context.Context
+	var cancel context.CancelFunc
 	if b.dialBudget > 0 {
 		dialCtx, cancel = context.WithTimeout(ctx, b.dialBudget)
+	} else {
+		dialCtx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
 

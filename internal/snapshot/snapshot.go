@@ -97,14 +97,14 @@ type entry struct {
 
 // Cache is the snapshot handler and its per-camera frame cache.
 type Cache struct {
-	cfg     Config
-	guard   *netguard.Guard
-	streams map[string]bool
-	warm    []string
-	client  *http.Client
-	now     func() time.Time
+	cfg    Config
+	guard  *netguard.Guard
+	client *http.Client
+	now    func() time.Time
 
 	mu      sync.Mutex
+	streams map[string]bool
+	warm    []string
 	entries map[string]*entry
 
 	ctx    context.Context
@@ -120,21 +120,9 @@ func New(cfg Config) (*Cache, error) {
 	if err != nil {
 		return nil, err
 	}
-	streams := make(map[string]bool, len(cfg.Streams))
-	for _, name := range cfg.Streams {
-		if name != "" {
-			streams[name] = true
-		}
-	}
-	if len(streams) == 0 {
-		return nil, errors.New("snapshot service needs at least one stream name")
-	}
-	warm := make([]string, 0, len(cfg.Warm))
-	for _, name := range cfg.Warm {
-		if !streams[name] {
-			return nil, fmt.Errorf("snapshot warm stream %q is not one of the configured streams", name)
-		}
-		warm = append(warm, name)
+	streams, warm, err := streamSets(cfg.Streams, cfg.Warm)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -166,6 +154,59 @@ func New(cfg Config) (*Cache, error) {
 	}, nil
 }
 
+// streamSets validates one stream list and the warm subset of it.
+func streamSets(names, warmNames []string) (map[string]bool, []string, error) {
+	streams := make(map[string]bool, len(names))
+	for _, name := range names {
+		if name != "" {
+			streams[name] = true
+		}
+	}
+	if len(streams) == 0 {
+		return nil, nil, errors.New("snapshot service needs at least one stream name")
+	}
+	warm := make([]string, 0, len(warmNames))
+	for _, name := range warmNames {
+		if !streams[name] {
+			return nil, nil, fmt.Errorf("snapshot warm stream %q is not one of the configured streams", name)
+		}
+		warm = append(warm, name)
+	}
+	return streams, warm, nil
+}
+
+// SetStreams replaces the streams that may be requested, for a credential
+// reload that added or removed a camera. Without it a camera that appeared in
+// the account was served a 404 by this endpoint until the add-on was restarted,
+// however well the rest of the reload worked. Frames cached for a stream that
+// is gone are dropped with it.
+func (c *Cache) SetStreams(names, warm []string) error {
+	if c == nil {
+		return nil
+	}
+	streams, warmed, err := streamSets(names, warm)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.streams = streams
+	c.warm = warmed
+	for name := range c.entries {
+		if !streams[name] {
+			delete(c.entries, name)
+		}
+	}
+	return nil
+}
+
+// allows reports whether one stream name may be requested.
+func (c *Cache) allows(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.streams[name]
+}
+
 // Close abandons any fetch still running.
 func (c *Cache) Close() {
 	if c != nil {
@@ -190,10 +231,10 @@ func (c *Cache) Warm() {
 	if c == nil {
 		return
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, name := range c.warm {
-		c.mu.Lock()
 		c.startLocked(name)
-		c.mu.Unlock()
 	}
 }
 
@@ -245,7 +286,7 @@ func (c *Cache) handler(requireToken bool) http.Handler {
 			}
 		}
 		source := query.Get("src")
-		if !c.streams[source] {
+		if !c.allows(source) {
 			http.Error(writer, "unknown camera", http.StatusNotFound)
 			return
 		}
@@ -276,7 +317,7 @@ func (c *Cache) Frame(ctx context.Context, stream string) ([]byte, error) {
 	if c == nil {
 		return nil, errors.New("snapshots are not configured")
 	}
-	if !c.streams[stream] {
+	if !c.allows(stream) {
 		return nil, fmt.Errorf("unknown stream %q", stream)
 	}
 	image, _, err := c.get(ctx, stream)

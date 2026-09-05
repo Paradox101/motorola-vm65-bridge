@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A camera added to the account stayed invisible in the add-on until it was
+  restarted.** A credential refresh hands the bridge a new camera list over
+  SIGHUP, and the relay bridges were swapped in place correctly — but the Web
+  UI, the still-image endpoint and the media proxy each held the camera list
+  they were built with at start. The new camera therefore answered 404 for its
+  thumbnail, "unknown stream" for its video and had no URL on the page. All
+  three now follow the reload, and a camera that left the account stops being
+  served just as promptly.
+- **The go2rtc endpoints that carry the camera's RTSP password could be reached
+  by writing their path differently.** The block list compared the request path
+  as it arrived, so `//api/config` and `/api/./config` missed it by a byte while
+  go2rtc resolved both to the configuration endpoint. Paths are cleaned before
+  they are matched, and `/api/streams` — which reports the source URL of every
+  active stream, access token included — is blocked as well. The player never
+  asks for it: it names the stream it wants on the media endpoints directly.
+- **A listener that could not bind was reported only as a log line**, after the
+  line that said it was listening, while the add-on carried on with an
+  unreachable Web UI and snapshot endpoint. A port that is already in use now
+  fails the start, which is what the port conflict is.
+- **A replaced temperature worker could overwrite the state of its
+  replacement.** Cancelling a worker does not stop it — a read waiting on the
+  camera runs to its own deadline first — so after a credential refresh the old
+  worker's final "unavailable" landed on the camera its successor was already
+  polling. Only the worker that still owns a camera reports its state.
+- **Two cameras could end up sharing one stream name.** Deduplication counted
+  per base name, so cameras named "Nursery", "Nursery" and "Nursery 2" produced
+  `nursery`, `nursery-2` and `nursery-2` — two cameras on one go2rtc stream, one
+  snapshot URL and one card on the page. Names are now checked against the ones
+  already handed out.
+- **Every relay session leaked a context.** The dial budget replaced a
+  cancellable context without cancelling it, and each abandoned one stayed
+  attached to the camera's long-lived context for the life of the process.
+- One camera whose discovery URL could not be built no longer stops the others
+  from being published, nor skips retiring the cameras that left the registry;
+  and a discovery failure no longer stops the bridge from starting, since the
+  cameras themselves are fine.
+- The MQTT service no longer keeps temperature state for cameras it does not
+  know about, so a removed camera leaves nothing behind.
+
+### Added
+
+- Tests for the temperature supervisor, which had none: capability discovery,
+  polling, the cameras it must skip, and the replaced-worker case above.
+
 ## 0.12.0
 
 ### Added

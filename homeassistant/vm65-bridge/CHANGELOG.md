@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A camera added to your account now appears in the add-on on the next
+  credential refresh instead of after a restart: its thumbnail, its video and
+  its card on the page used to keep answering as if it did not exist.
+- The go2rtc endpoints that carry the camera's RTSP password and access token
+  are blocked in every spelling of their path, and the stream list is blocked
+  too. Live video does not use either.
+- A port that is already in use now stops the add-on with the reason, instead of
+  leaving the Web UI and snapshots quietly unreachable.
+- After a credential refresh, a camera's temperature no longer shows as
+  unavailable while it is being read.
+- Two cameras with near-identical names no longer end up sharing one video
+  stream and one snapshot.
+
 ## 0.12.0
 
 ### Added

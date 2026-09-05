@@ -178,12 +178,19 @@ func (s *Service) SetTemperatureSupported(ctx context.Context, id string, suppor
 // fail without the other one failing.
 func (s *Service) SetTemperatureAvailable(ctx context.Context, id string, available bool) error {
 	s.mu.Lock()
+	_, registered := s.cameras[id]
 	supported := s.temperatureSupported[id]
 	previous, known := s.temperatureAvailable[id]
-	s.temperatureAvailable[id] = available
+	if registered {
+		// Only registered cameras are recorded. A control worker that reports
+		// after its camera left the registry would otherwise put the entry back
+		// that Remove just deleted, and every removed camera would leave one
+		// behind for the life of the process.
+		s.temperatureAvailable[id] = available
+	}
 	connected := s.connected
 	s.mu.Unlock()
-	if !supported || !connected || (known && previous == available) {
+	if !registered || !supported || !connected || (known && previous == available) {
 		return nil
 	}
 	return s.client.Publish(ctx, s.cameraTopic(id, "temperature_availability"), true, []byte(availabilityPayload(available)))
@@ -196,11 +203,14 @@ func (s *Service) PublishTemperature(ctx context.Context, id string, celsius flo
 		return errors.New("mqtt temperature must be between 0 and 50 Celsius")
 	}
 	s.mu.Lock()
+	_, registered := s.cameras[id]
 	supported := s.temperatureSupported[id]
 	connected := s.connected
-	s.temperatureAvailable[id] = true
+	if registered {
+		s.temperatureAvailable[id] = true
+	}
 	s.mu.Unlock()
-	if !supported || !connected {
+	if !registered || !supported || !connected {
 		return nil
 	}
 	return errors.Join(
@@ -469,7 +479,10 @@ func (s *Service) publishCamera(ctx context.Context, camera Camera) error {
 	// payload carrying one created no entity at all — so it exists only while
 	// frames are being published to it.
 	if s.config.PublishCameraFrames {
-		camera := entity{
+		// Deliberately not named `camera`: shadowing the camera this function
+		// is publishing, inside the block that publishes it, is one rename away
+		// from a payload that describes the wrong device.
+		cameraEntity := entity{
 			Name:             "Camera",
 			UniqueID:         camera.ID + "_camera",
 			Topic:            s.cameraTopic(camera.ID, "image"),
@@ -478,7 +491,7 @@ func (s *Service) publishCamera(ctx context.Context, camera Camera) error {
 			Icon:             "mdi:cctv",
 			Device:           device,
 		}
-		errs = append(errs, s.publishEntity(ctx, "camera", object, camera))
+		errs = append(errs, s.publishEntity(ctx, "camera", object, cameraEntity))
 	} else {
 		errs = append(errs,
 			s.client.Publish(ctx, s.discoveryTopic("camera", object), true, nil),

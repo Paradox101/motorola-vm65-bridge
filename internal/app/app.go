@@ -152,9 +152,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 	r.mu.Lock()
 	r.baseCtx = runCtx
 	r.baseCancel = cancel
+	cameras := r.cfg.Registry.Cameras
 	r.mu.Unlock()
 
-	for _, camera := range r.cfg.Registry.Cameras {
+	for _, camera := range cameras {
 		server, err := r.startServer(camera)
 		if err != nil {
 			r.stopAll()
@@ -239,7 +240,11 @@ func (r *Runtime) Reload(registry Registry) error {
 		r.cfg.Logger.Info("starting camera bridge", "camera", camera.StreamName, "listen", camera.ListenAddr)
 		r.add(ctx, camera, server)
 	}
+	// Under the lock: Run reads this field while a SIGHUP reload writes it, and
+	// the two run in different goroutines.
+	r.mu.Lock()
 	r.cfg.Registry = registry
+	r.mu.Unlock()
 	r.publishBridges()
 	return errors.Join(failures...)
 }

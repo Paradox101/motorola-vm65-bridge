@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -107,7 +108,9 @@ func run(cfg appconfig.Config, logger *slog.Logger) error {
 	}
 
 	if cfg.StatusAddr != "" {
-		startHTTPServer(ctx, "health endpoint", cfg.StatusAddr, health.NewHandler(healthState), logger)
+		if err := startHTTPServer(ctx, "health endpoint", cfg.StatusAddr, health.NewHandler(healthState), logger); err != nil {
+			return err
+		}
 	}
 
 	// The runtime is built before the Web UI so the page can report live camera
@@ -117,13 +120,12 @@ func run(cfg appconfig.Config, logger *slog.Logger) error {
 
 	// The Web UI and the snapshot endpoint share one listener, the one the
 	// Supervisor reaches through Ingress. Neither is published on the host.
-	snapshots, err := startWebServer(ctx, cfg, registry, runtime, temperatures, healthState, logger)
+	web, err := startWebServer(ctx, cfg, registry, runtime, temperatures, healthState, logger)
 	if err != nil {
 		return err
 	}
-	if snapshots != nil {
-		defer snapshots.Close()
-	}
+	snapshots := web.cache()
+	defer snapshots.Close()
 
 	// Temperature is read for the Web UI, not for the broker: the store records
 	// every reading and only passes it on to MQTT when a broker is configured.
@@ -163,8 +165,11 @@ func run(cfg appconfig.Config, logger *slog.Logger) error {
 			discovery = nil
 		} else {
 			publisher.service = discovery
+			// Discovery is an extra, not the product: a camera whose entity
+			// could not be published must not stop the bridge that is about to
+			// stream it.
 			if publishErr := publisher.publish(ctx, cfg, registry, logger, healthState); publishErr != nil {
-				return publishErr
+				logger.Warn("some cameras could not be published to MQTT discovery", "err", publishErr)
 			}
 			defer func() {
 				shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -185,7 +190,7 @@ func run(cfg appconfig.Config, logger *slog.Logger) error {
 	// SIGHUP swaps in freshly written credentials. Cameras whose credentials did
 	// not change keep streaming, so the periodic refresh no longer costs every
 	// viewer their picture.
-	go watchForReload(ctx, cfg, runtime, publisher, temperatureSupervisor, logger, healthState)
+	go watchForReload(ctx, cfg, runtime, web, publisher, temperatureSupervisor, logger, healthState)
 
 	// Keep the diagnostic entities and per-camera availability in step with the
 	// runtime, so Home Assistant shows which camera is down instead of leaving
@@ -244,7 +249,7 @@ func mirrorStateToMQTT(ctx context.Context, service *mqttdiscovery.Service, runt
 }
 
 // watchForReload applies a new credential file on SIGHUP until ctx is done.
-func watchForReload(ctx context.Context, cfg appconfig.Config, runtime *app.Runtime, publisher *discoveryPublisher, temperatureSupervisor *devicecontrol.Supervisor, logger *slog.Logger, healthState *health.State) {
+func watchForReload(ctx context.Context, cfg appconfig.Config, runtime *app.Runtime, web *webStack, publisher *discoveryPublisher, temperatureSupervisor *devicecontrol.Supervisor, logger *slog.Logger, healthState *health.State) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGHUP)
 	defer signal.Stop(signals)
@@ -271,6 +276,10 @@ func watchForReload(ctx context.Context, cfg appconfig.Config, runtime *app.Runt
 				logger.Error("some cameras failed to restart after reload", "err", err)
 				healthState.SetLastError(health.ErrorNetwork)
 			}
+			// The Web UI, the stills and the media proxy each hold a camera
+			// list of their own; a camera the account gained is invisible to
+			// all three until they are told about it.
+			web.reload(cfg, registry, logger)
 			if err := publisher.publish(ctx, cfg, registry, logger, healthState); err != nil {
 				logger.Error("MQTT discovery refresh failed", "err", err)
 				healthState.SetLastError(health.ErrorBroker)
@@ -311,6 +320,7 @@ func (p *discoveryPublisher) publish(ctx context.Context, cfg appconfig.Config, 
 	if p.service == nil {
 		return nil
 	}
+	var failures []error
 	current := make(map[string]struct{}, len(registry.Cameras))
 	for index, camera := range registry.Cameras {
 		name := camera.Credentials.DeviceName
@@ -321,7 +331,13 @@ func (p *discoveryPublisher) publish(ctx context.Context, cfg appconfig.Config, 
 		streamName := publishedStreamName(registry, camera, index)
 		streamURL, err := discoveryStreamURL(cfg.StreamURL, camera.StreamName, index == 0)
 		if err != nil {
-			return err
+			// One camera whose URL cannot be built is not a reason to leave the
+			// others undiscovered, nor to skip retiring the cameras that left
+			// the registry — which returning here used to do.
+			logger.Warn("could not build the discovery stream URL", "camera", camera.StreamName, "err", err)
+			healthState.SetLastError(health.ErrorConfiguration)
+			failures = append(failures, err)
+			continue
 		}
 		if err := p.service.Upsert(ctx, mqttdiscovery.Camera{
 			ID:          camera.Credentials.DeviceUDID,
@@ -347,7 +363,7 @@ func (p *discoveryPublisher) publish(ctx context.Context, cfg appconfig.Config, 
 	for id := range current {
 		p.published = append(p.published, id)
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 // streamNames lists every go2rtc stream this add-on owns, including the
@@ -485,9 +501,13 @@ type uiSource struct {
 	runtime      *app.Runtime
 	health       *health.State
 	temperatures *temperatureStore
-	streamURLs   map[string]string
-	streamNames  map[string]string
 	streamHost   string
+
+	// mu guards the per-camera maps, which a credential reload replaces while
+	// the page is being rendered.
+	mu          sync.RWMutex
+	streamURLs  map[string]string
+	streamNames map[string]string
 
 	// go2rtcURL is the media server this add-on owns, restarted through its own
 	// loopback API. allowMediaRestart and allowCredentialRefresh say whether
@@ -510,6 +530,16 @@ func newUISource(cfg appconfig.Config, registry app.Registry, runtime *app.Runti
 		allowCredentialRefresh: cfg.AllowCredentialRefresh,
 		refreshSignal:          signalParentRefresh,
 	}
+	source.setRegistry(cfg, registry)
+	return source
+}
+
+// setRegistry rebuilds the per-camera stream names and URLs. A reload that
+// added a camera has to reach the page too: without it the new camera was
+// rendered with no stream URL and played nothing until the add-on restarted.
+func (u *uiSource) setRegistry(cfg appconfig.Config, registry app.Registry) {
+	names := make(map[string]string, len(registry.Cameras))
+	urls := make(map[string]string, len(registry.Cameras))
 	for index, camera := range registry.Cameras {
 		key := camera.Credentials.DeviceUDID
 		if key == "" {
@@ -517,13 +547,22 @@ func newUISource(cfg appconfig.Config, registry app.Registry, runtime *app.Runti
 		}
 		// The first camera keeps the historical vm65 alias in go2rtc, so that
 		// is the name the player has to ask for.
-		name := publishedStreamName(registry, camera, index)
-		source.streamNames[key] = name
+		names[key] = publishedStreamName(registry, camera, index)
 		if url, err := discoveryStreamURL(cfg.StreamURL, camera.StreamName, index == 0); err == nil {
-			source.streamURLs[key] = url
+			urls[key] = url
 		}
 	}
-	return source
+	u.mu.Lock()
+	u.streamNames = names
+	u.streamURLs = urls
+	u.mu.Unlock()
+}
+
+// stream reports the go2rtc stream name and RTSP URL of one camera.
+func (u *uiSource) stream(id string) (name, url string) {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.streamNames[id], u.streamURLs[id]
 }
 
 func (u *uiSource) Overview() webui.Overview {
@@ -535,14 +574,14 @@ func (u *uiSource) Overview() webui.Overview {
 		if name == "" {
 			name = "Motorola Nursery Camera"
 		}
-		stream := u.streamNames[state.ID]
+		stream, streamURL := u.stream(state.ID)
 		if stream == "" {
 			stream = state.StreamName
 		}
 		camera := webui.Camera{
 			ID: state.ID, Name: name, Model: state.Model,
 			Stream: stream, MJPEGStream: stream + mjpegSuffix,
-			StreamURL: u.streamURLs[state.ID],
+			StreamURL: streamURL,
 			Serving:   state.Serving, ActiveSessions: state.ActiveSessions,
 		}
 		if celsius, ok := u.temperatures.reading(state.ID); ok {
@@ -658,10 +697,45 @@ func publishCameraFrames(ctx context.Context, service *mqttdiscovery.Service, sn
 	}
 }
 
+// webStack is everything the Ingress listener serves that has to learn about a
+// camera the account gained: the stills, the media proxy's stream allowlist and
+// the page's own per-camera names. Each of them was fixed at startup, so a
+// SIGHUP that added a camera left it with a 404 for its thumbnail, "unknown
+// stream" for its video and no URL on the page until the add-on was restarted.
+type webStack struct {
+	snapshots *snapshot.Cache
+	media     *ingress.Handler
+	source    *uiSource
+}
+
+// reload hands a new registry to each of them.
+func (w *webStack) reload(cfg appconfig.Config, registry app.Registry, logger *slog.Logger) {
+	if w == nil {
+		return
+	}
+	names := streamNames(registry)
+	if w.media != nil {
+		w.media.SetStreams(names)
+	}
+	if err := w.snapshots.SetStreams(names, publishedStreams(registry)); err != nil {
+		logger.Error("could not apply the new camera list to the snapshot endpoint", "err", err)
+	}
+	if w.source != nil {
+		w.source.setRegistry(cfg, registry)
+	}
+}
+
+// cache is the snapshot cache, or nil when there is no Web UI at all.
+func (w *webStack) cache() *snapshot.Cache {
+	if w == nil {
+		return nil
+	}
+	return w.snapshots
+}
+
 // startWebServer serves the authenticated Web UI and the snapshot endpoint on
-// the Ingress port. It returns the snapshot cache, or nil when no ingress
-// address is configured.
-func startWebServer(ctx context.Context, cfg appconfig.Config, registry app.Registry, runtime *app.Runtime, temperatures *temperatureStore, healthState *health.State, logger *slog.Logger) (*snapshot.Cache, error) {
+// the Ingress port. It returns nil when no ingress address is configured.
+func startWebServer(ctx context.Context, cfg appconfig.Config, registry app.Registry, runtime *app.Runtime, temperatures *temperatureStore, healthState *health.State, logger *slog.Logger) (*webStack, error) {
 	if cfg.IngressAddr == "" {
 		return nil, nil
 	}
@@ -707,8 +781,9 @@ func startWebServer(ctx context.Context, cfg appconfig.Config, registry app.Regi
 		return nil, err
 	}
 
+	source := newUISource(cfg, registry, runtime, temperatures, healthState)
 	ui, err := webui.NewServer(webui.Config{
-		Source:       newUISource(cfg, registry, runtime, temperatures, healthState),
+		Source:       source,
 		TrustedCIDRs: cfg.IngressTrustedCIDRs,
 		Media:        media,
 		Snapshot:     snapshots.TrustedHandler(),
@@ -720,12 +795,15 @@ func startWebServer(ctx context.Context, cfg appconfig.Config, registry app.Regi
 	}
 	mux.Handle("/", ui.Handler())
 
-	startHTTPServer(ctx, "web UI", cfg.IngressAddr, mux, logger)
+	if err := startHTTPServer(ctx, "web UI", cfg.IngressAddr, mux, logger); err != nil {
+		snapshots.Close()
+		return nil, err
+	}
 	// go2rtc has to start the relay tunnel, the camera stream and a transcode
 	// before it can produce a still frame. Doing that now means the first
 	// dashboard to ask for a thumbnail does not wait for it.
 	snapshots.Warm()
-	return snapshots, nil
+	return &webStack{snapshots: snapshots, media: media, source: source}, nil
 }
 
 func monitorGo2RTC(ctx context.Context, client *http.Client, endpoint string, interval time.Duration, state *health.State) {
@@ -769,9 +847,16 @@ func discoveryStreamURL(base, streamName string, legacy bool) (string, error) {
 }
 
 // startHTTPServer runs one of the bridge's HTTP listeners until ctx is
-// cancelled.
-func startHTTPServer(ctx context.Context, name, addr string, handler http.Handler, logger *slog.Logger) {
-	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+// cancelled. It binds before returning: a port that is already taken is a
+// configuration error worth failing on, and reporting it as a log line while
+// the process carried on left the Web UI and the snapshot endpoint silently
+// unreachable behind a line that said they were listening.
+func startHTTPServer(ctx context.Context, name, addr string, handler http.Handler, logger *slog.Logger) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen for the %s on %s: %w", name, addr, err)
+	}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -779,11 +864,12 @@ func startHTTPServer(ctx context.Context, name, addr string, handler http.Handle
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 	go func() {
-		logger.Info(name+" listening", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Info(name+" listening", "addr", listener.Addr().String())
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error(name+" failed", "err", err)
 		}
 	}()
+	return nil
 }
 
 func loadCreds(path string) (bridge.Credentials, error) {

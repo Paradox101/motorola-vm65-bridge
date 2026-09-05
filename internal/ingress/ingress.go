@@ -25,7 +25,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strings"
+	"sync"
 )
 
 // UserIDHeader is the header the Supervisor sets on every ingress request. Its
@@ -43,13 +45,16 @@ var remoteUserHeaders = []string{
 	"X-Remote-User-Display-Name",
 }
 
-// blockedPaths never reach go2rtc. `/api/config` and `/api/streams.dot` expose
-// the generated configuration, which carries the camera's RTSP password and
-// access token; the rest change the running process.
+// blockedPaths never reach go2rtc. `/api/config`, `/api/streams` and
+// `/api/streams.dot` expose the generated configuration and the stream sources,
+// which carry the camera's RTSP password and access token; the rest change the
+// running process. The player needs none of them: the Web UI names the stream
+// it wants on the media endpoints directly.
 var blockedPaths = map[string]bool{
 	"/api/config":      true,
 	"/api/exit":        true,
 	"/api/restart":     true,
+	"/api/streams":     true,
 	"/api/streams.dot": true,
 }
 
@@ -68,8 +73,10 @@ type Config struct {
 	Logger      *slog.Logger
 }
 
-// NewHandler builds the authenticating reverse proxy.
-func NewHandler(cfg Config) (http.Handler, error) {
+// NewHandler builds the authenticating reverse proxy. The concrete type is
+// returned so a credential reload can replace the stream allowlist; it is an
+// http.Handler wherever only that is needed.
+func NewHandler(cfg Config) (*Handler, error) {
 	target, err := url.Parse(cfg.Upstream)
 	if err != nil || (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" {
 		return nil, errors.New("ingress upstream must be an absolute http or https URL")
@@ -80,12 +87,6 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	authenticator, err := NewAuthenticator(cfg.TrustedCIDRs, cfg.Logger)
 	if err != nil {
 		return nil, err
-	}
-	streams := make(map[string]bool, len(cfg.Streams))
-	for _, name := range cfg.Streams {
-		if name != "" {
-			streams[name] = true
-		}
 	}
 	requireUser := true
 	if cfg.RequireUser != nil {
@@ -134,25 +135,54 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		},
 	}
 
-	handler := &authProxy{
+	handler := &Handler{
 		proxy:         proxy,
 		authenticator: authenticator,
-		streams:       streams,
+		streams:       streamSet(cfg.Streams),
 		requireUser:   requireUser,
 		logger:        cfg.Logger,
 	}
 	return handler, nil
 }
 
-type authProxy struct {
+// Handler is the authenticating go2rtc proxy.
+type Handler struct {
 	proxy         http.Handler
 	authenticator *Authenticator
-	streams       map[string]bool
 	requireUser   bool
 	logger        *slog.Logger
+
+	mu      sync.RWMutex
+	streams map[string]bool
 }
 
-func (a *authProxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+// SetStreams replaces the stream names a request may name in `src`. A
+// credential reload that added a camera has to hand it over, or the player asks
+// for a stream this proxy still refuses as unknown until the add-on restarts.
+func (a *Handler) SetStreams(names []string) {
+	set := streamSet(names)
+	a.mu.Lock()
+	a.streams = set
+	a.mu.Unlock()
+}
+
+func (a *Handler) allows(name string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.streams[name]
+}
+
+func streamSet(names []string) map[string]bool {
+	streams := make(map[string]bool, len(names))
+	for _, name := range names {
+		if name != "" {
+			streams[name] = true
+		}
+	}
+	return streams
+}
+
+func (a *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if a.requireUser {
 		if !a.authenticator.Allow(writer, request) {
 			return
@@ -171,9 +201,10 @@ func (a *authProxy) ServeHTTP(writer http.ResponseWriter, request *http.Request)
 }
 
 // refuse decides whether one request may reach go2rtc, and says why not.
-func (a *authProxy) refuse(request *http.Request) (string, bool) {
-	path := normalizePath(request.URL.Path)
-	if blockedPaths[path] {
+func (a *Handler) refuse(request *http.Request) (string, bool) {
+	// Not named `path`: that is the package normalizePath cleans with.
+	requestPath := normalizePath(request.URL.Path)
+	if blockedPaths[requestPath] {
 		return "this go2rtc endpoint is not exposed through the add-on", false
 	}
 	// Only reads pass. Every go2rtc write endpoint either edits the running
@@ -182,14 +213,14 @@ func (a *authProxy) refuse(request *http.Request) (string, bool) {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 	case http.MethodPost:
 		// WebRTC and MSE negotiation are posts against an existing stream.
-		if path != "/api/webrtc" && path != "/api/stream" {
+		if requestPath != "/api/webrtc" && requestPath != "/api/stream" {
 			return "the Web UI is read-only in this add-on", false
 		}
 	default:
 		return "the Web UI is read-only in this add-on", false
 	}
 	for _, value := range srcValues(request.URL.Query()) {
-		if !a.streams[value] {
+		if !a.allows(value) {
 			// A src that is not a configured stream is a request for go2rtc to
 			// create one, and "exec:" is a source scheme.
 			return "unknown stream", false
@@ -208,15 +239,17 @@ func srcValues(query url.Values) []string {
 }
 
 // normalizePath makes the block list independent of a trailing slash or of a
-// path the Supervisor did not clean.
-func normalizePath(path string) string {
-	if path == "" {
+// path the Supervisor did not clean. path.Clean does the collapsing: without it
+// "//api/config" and "/api/./config" miss the block list by a byte while go2rtc
+// resolves both to the endpoint that returns the camera's RTSP password.
+func normalizePath(requestPath string) string {
+	if requestPath == "" {
 		return "/"
 	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
+	if !strings.HasPrefix(requestPath, "/") {
+		requestPath = "/" + requestPath
 	}
-	cleaned := strings.TrimSuffix(path, "/")
+	cleaned := strings.TrimSuffix(path.Clean(requestPath), "/")
 	if cleaned == "" {
 		return "/"
 	}
